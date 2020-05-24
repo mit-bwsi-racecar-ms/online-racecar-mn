@@ -10,8 +10,7 @@ from matplotlib import pyplot as plt
 
 # ROS 
 try:
-    import rospy
-    from rospy.numpy_msg import numpy_msg
+    import rclpy
     from sensor_msgs.msg import LaserScan
     from sensor_msgs.msg import Image
     from ackermann_msgs.msg import AckermannDriveStamped
@@ -26,10 +25,15 @@ import time
 
 # Used for HSV select
 import threading
-try:
-    import ipywidgets as widgets
-except:
-    print('ipywidgets is not installed')
+import ipywidgets as widgets
+  
+import pyrealsense2 as rs
+from rclpy.qos import QoSDurabilityPolicy, QoSHistoryPolicy, QoSReliabilityPolicy, QoSProfile 
+
+# Start ROS node
+rclpy.init(args=None)
+rc = rclpy.create_node('Racecar')
+print('ROS node started successfully')
 
 #############################
 #### Parameters
@@ -46,77 +50,25 @@ resize_width = 640
 resize_height = 480
 
 #############################
-#### Racecar ROS Class
+#### ROS Driving
 #############################
 
-# Starter code class that handles the fancy stuff. No need to modify this!
-cap = None
-released = True
-class Racecar:
-    SCAN_TOPIC = "/scan"
-    IMAGE_TOPIC = "/camera"
-    DRIVE_TOPIC = "/drive"
+def withDriving(callback):
+    qos_profile = QoSProfile(depth=1)
+    qos_profile.history = QoSHistoryPolicy.RMW_QOS_POLICY_HISTORY_KEEP_LAST
+    qos_profile.reliability = QoSReliabilityPolicy.RMW_QOS_POLICY_RELIABILITY_BEST_EFFORT
+    qos_profile.durability = QoSDurabilityPolicy.RMW_QOS_POLICY_DURABILITY_VOLATILE
+    publisher = rc.create_publisher(AckermannDriveStamped, '/drive', qos_profile)
     
-    def __init__(self):
-        self.sub_scan = rospy.Subscriber(self.SCAN_TOPIC, LaserScan, callback=self.scan_callback)
-        self.sub_image = rospy.Subscriber(self.IMAGE_TOPIC, Image, callback=self.image_callback)
-        self.pub_drive = rospy.Publisher(self.DRIVE_TOPIC, AckermannDriveStamped, queue_size=1)
-        self.last_drive = AckermannDriveStamped()
-    
-    def image_callback(self, msg):
-        self.last_image = msg.data
-        
-    def show_last_image(self):
-        im = np.fromstring(self.last_image,dtype=np.uint8).reshape((480,-1,3))[...,::-1]
-        return im
-        
-    def scan_callback(self, msg):
-        self.last_scan = msg.ranges
-        
-    def drive(self, speed, angle):
+    def drive(speed, angle):
         msg = AckermannDriveStamped()
         msg.drive.speed = speed
-        msg.drive.steering_angle = angle*(0.25/20)  # thresholded at 0.25 radians, approx 20 degrees
-        self.last_drive = msg
-    
-    def stop(self):
-        self.drive(0, 0) #self.last_drive.drive.steering_angle)
-    
-    def look(self):
-        return self.last_image
-    
-    def scan(self):
-        return self.last_scan
-    
-    def run(self, func, limit=10):
-        global cap, released
-        r = rospy.Rate(60)
-        t = rospy.get_time()
-        if not released:
-            cap.release()
-            released = True
-        cap = cv2.VideoCapture(video_port)
-        resize_cap(cap, resize_height, resize_width)
-        released = False
-        while rospy.get_time() - t < limit and not rospy.is_shutdown():
-            frame = None
-            try:
-                frame = cap.read()[1]
-            except:
-                print('Video feed is in use. Please run again or restart kernel.')
-            if frame is None:
-                print('Video feed is in use. Please run again or restart kernel.')
-                break
-            else:
-                func(cap.read()[1])
-                self.pub_drive.publish(self.last_drive)
-            r.sleep()
-        cap.release()
-        released = True
-        print("END OF ROSPY RUN")
-        self.stop()
-        self.pub_drive.publish(self.last_drive)
-        time.sleep(0.1)
+        msg.drive.steering_angle = angle
+        publisher.publish(msg)
+        
+    callback(drive)
+    # Send an empty message, whch will stop the car
+    publisher.publish(AckermannDriveStamped())
 
 #############################
 #### General Display
@@ -143,26 +95,100 @@ def resize_cap(cap, width, height):
     cap.set(4,height)
 
 #############################
-#### Identify Cone
+#### Frame Processing
 #############################
 
-def show_video(func, time_limit, rc):
-    global display, current_display_id
-    display = IPython.display.display('', display_id=current_display_id)
-    current_display_id += 1
+def withRealSenseImages(frameProcessor, options, limit = None):
+    color = options.get('color', 'rgb')
+    depth = options.get('depth', False)
+    # RealSense maximum resolution
+    width = options.get('width', 1920)
+    height = options.get('height', 1080)
+    frame_rate = options.get('frame-rate', 30)
     
-    rc.run(func, time_limit)
+    if not (color or depth):
+        print('Specify color or depth')
+        return
+    
+    pipeline = rs.pipeline()
+    config = rs.config()
+    
+    if color:
+        if color == 'bgr':
+            config.enable_stream(rs.stream.color, width, height, rs.format.bgr8, frame_rate)
+        else:
+            config.enable_stream(rs.stream.color, width, height, rs.format.rgb8, frame_rate)
+    if depth:
+        config.enable_stream(rs.stream.depth, width, height, rs.format.z16, frame_rate)
 
-def show_image(func):
-    global display, current_display_id
+    # Start streaming
+    pipeline.start(config)
+
+    try:
+        start = time.time()
+        while limit == None or time.time() - start < limit:
+            # Wait for a coherent pair of frames: depth and color
+            frames = pipeline.wait_for_frames()
+            if color:
+                if depth:
+                    color_frame = frames.get_color_frame()
+                    depth_frame = frames.get_depth_frame()
+                    if color_frame and depth_frame:
+                        frameProcessor(np.asanyarray(color_frame.get_data()),
+                                       np.asanyarray(depth_frame.get_data()))
+                else:
+                    frameProcessor(np.asanyarray(frames.get_color_frame().get_data()))
+            elif depth:
+                frameProcessor(np.asanyarray(frames.get_depth_frame().get_data()))
+    finally:
+        # Stop streaming
+        pipeline.stop()
+        
+def show_video(func, time_limit = 10, use_both_frames = False, show_video = True):
+
+    global current_display_id
     display = IPython.display.display('', display_id=current_display_id)
     current_display_id += 1
     
-    cap = cv2.VideoCapture(video_port)
-    resize_cap(cap, resize_width, resize_height)
-    frame = func(cap.read()[1])  
-    show_frame(frame)
-    cap.release()
+    def display_frame(color_image):
+        processed_img = func(color_image)
+        if show_video:
+            f = BytesIO()
+            PIL.Image.fromarray(processed_img).save(f, 'jpeg')
+            img = IPython.display.Image(data=f.getvalue())
+            display.update(img)
+            time.sleep(0.2)
+    
+    def display_both_frames(color_image, depth_image):
+        depth_colormap = cv2.applyColorMap(cv2.convertScaleAbs(depth_image, alpha=0.03), cv2.COLORMAP_JET)
+        processed_img = func(color_image, depth_colormap)
+
+        if show_video:
+            f = BytesIO()
+            PIL.Image.fromarray(processed_img).save(f, 'jpeg')
+            img = IPython.display.Image(data=f.getvalue())
+            display.update(img)
+            time.sleep(0.2)
+            
+    if use_both_frames:
+        withRealSenseImages(display_both_frames, {'width': 640, 'height': 480, 'depth': use_both_frames}, time_limit)
+    else:
+        withRealSenseImages(display_frame, {'width': 640, 'height': 480, 'depth': use_both_frames}, time_limit)
+
+def show_videox(func, time_limit = 10, use_both_frames = False, show_video = True):
+
+    canvas = Canvas(width=640, height=480)
+
+    def display_frames(color_image, depth_image):
+        if use_both_frames:
+            processed_img = func(color_image, depth_image)
+        else:
+            processed_img = func(color_image)
+
+        if show_video:
+            canvas.put_image_data(processed_image, 0, 0)
+        
+    withRealSenseImages(display_frames, {'width': 640, 'height': 480, 'depth': True}, time_limit)
 
 def show_picture(img):
     global display, current_display_id
@@ -181,63 +207,47 @@ def show_picture(img):
 #############################
 
 # Mask and display video
-def hsv_select_live(limit = 10, fps = 4):
+def hsv_select_live(limit = 10, fps = 5):
+    
     global current_display_id
     display = IPython.display.display('', display_id=current_display_id)
     current_display_id += 1
-    
+
     # Create sliders
-    h = widgets.IntRangeSlider(value=[0, 179], min=0, max=179, description='Hue:', continuous_update=True, layout=widgets.Layout(width='100%'))
-    s = widgets.IntRangeSlider(value=[0, 255], min=0, max=255, description='Saturation:', continuous_update=True, layout=widgets.Layout(width='100%'))
-    v = widgets.IntRangeSlider(value=[0, 255], min=0, max=255, description='Value:', continuous_update=True, layout=widgets.Layout(width='100%'))
+    h = widgets.IntRangeSlider(value=[0, 179], min=0, max=179,
+                               description='Hue:', continuous_update=True,
+                               layout=widgets.Layout(width='100%'))
+    s = widgets.IntRangeSlider(value=[0, 255], min=0, max=255,
+                               description='Saturation:', continuous_update=True,
+                               layout=widgets.Layout(width='100%'))
+    v = widgets.IntRangeSlider(value=[0, 255], min=0, max=255,
+                               description='Value:', continuous_update=True,
+                               layout=widgets.Layout(width='100%'))
     display.update(h)
     display.update(s)
     display.update(v)
-    
-    # Live masked video for the thread
-    def show_masked_video():
-        global cap, released
-        if not released:
-            cap.release()
-            released = True
-        cap = cv2.VideoCapture(video_port)
-        resize_cap(cap, resize_width, resize_height)
-        released = False
-        start = time.time()
-        while time.time() - start < limit:
-            frame = None
-            try:
-                frame = cap.read()[1]
-            except:
-                print('Video feed is in use. Please run again or restart kernel.')
-            if frame is None:
-                print('Video feed is in use. Please run again or restart kernel.')
-                break
-            else:
-                try:
-                    hsv_min = (h.value[0], s.value[0], v.value[0])
-                    hsv_max = (h.value[1], s.value[1], v.value[1])
-                    frame = cv2.flip(frame, 1)
-                    frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                    img_hsv = cv2.cvtColor(frame, cv2.COLOR_RGB2HSV)
-                    mask = cv2.inRange(img_hsv, hsv_min, hsv_max)
-                    img_masked = cv2.bitwise_and(frame, frame, mask = mask)
-                    f = BytesIO()
-                    PIL.Image.fromarray(img_masked).save(f, 'jpeg')
-                    img_jpeg = IPython.display.Image(data=f.getvalue())
-                    display.update(img_jpeg)
-                    time.sleep(1.0 / fps)
-                except Exception as e:
-                    print(e)
-                    break
-        cap.release()
-        released = True
-        print('END OF HSV SELECT')
-    
+
+    def show_masked_video():  
+        def processFrame(color_image = None):
+            hsv_min = (h.value[0], s.value[0], v.value[0])
+            hsv_max = (h.value[1], s.value[1], v.value[1])
+            img_hsv = cv2.cvtColor(color_image, cv2.COLOR_RGB2HSV)
+            mask = cv2.inRange(img_hsv, hsv_min, hsv_max)
+            img_masked = cv2.bitwise_and(color_image, color_image, mask = mask)
+
+            f = BytesIO()
+            PIL.Image.fromarray(img_masked).save(f, 'jpeg')
+            img = IPython.display.Image(data=f.getvalue())
+            display.update(img)
+            time.sleep(1.0 / fps)
+            
+        withRealSenseImages(processFrame, {'width': 640, 'height': 480, 'frame-rate': 30}, limit)
+
     # Open video on new thread (needed for slider update)
     hsv_thread = threading.Thread(target=show_masked_video)
     hsv_thread.start()
 
+    
 #############################
 #### Feature Detection
 #############################
