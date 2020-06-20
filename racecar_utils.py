@@ -241,7 +241,7 @@ def hsv_select_live(limit = 10, fps = 5):
             display.update(img)
             time.sleep(1.0 / fps)
             
-        withRealSenseImages(processFrame, {'width': 640, 'height': 480, 'frame-rate': 30}, limit)
+        withRealSenseImages(processFrame, {'width': 320, 'height': 240, 'frame-rate': 30}, limit)
 
     # Open video on new thread (needed for slider update)
     hsv_thread = threading.Thread(target=show_masked_video)
